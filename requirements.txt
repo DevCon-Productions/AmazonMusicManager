@@ -1,0 +1,7 @@
+# Amazon Music Manager — runtime dependencies.
+# Install with:  pip install -r requirements.txt
+# (To build the Windows installer, also: pip install pyinstaller)
+playwright>=1.40
+openpyxl>=3.1
+PyQt6>=6.11
+pycaw>=20240210
