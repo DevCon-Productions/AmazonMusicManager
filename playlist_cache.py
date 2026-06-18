@@ -9,8 +9,9 @@ import os
 from datetime import datetime
 
 from utils import logger
+from config import OUTPUT_DIR
 
-_CACHE_FILE = "./output/playlists.json"
+_CACHE_FILE = os.path.join(OUTPUT_DIR, "playlists.json")
 
 
 def load_cached_playlists() -> list[dict] | None:

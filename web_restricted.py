@@ -45,11 +45,13 @@ import threading
 from datetime import datetime
 from typing import Any
 
+from config import OUTPUT_DIR
+
 logger = logging.getLogger(__name__)
 
-# Default storage path — kept under ./output so it travels with the user's
+# Default storage path — kept under the data dir so it travels with the user's
 # spreadsheets if they back up that directory.
-DEFAULT_STORE_PATH = "./output/web_restricted_tracks.json"
+DEFAULT_STORE_PATH = os.path.join(OUTPUT_DIR, "web_restricted_tracks.json")
 
 # File access lock — read/write are infrequent (once per click bailout) but
 # Classical Shuffle and the GUI thread could theoretically both touch it.

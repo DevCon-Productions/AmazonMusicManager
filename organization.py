@@ -16,8 +16,8 @@ import json
 import os
 from typing import Iterable
 
-ORG_FILE = "./output/organization.json"
-_OUTPUT_DIR = "./output"
+from config import OUTPUT_DIR as _OUTPUT_DIR
+ORG_FILE = os.path.join(_OUTPUT_DIR, "organization.json")
 _VERSION = 1
 
 

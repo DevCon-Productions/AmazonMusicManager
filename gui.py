@@ -94,8 +94,7 @@ MIME_SPREADSHEET = "application/x-amm-spreadsheet-path"
 MIME_PLAYLIST = "application/x-amm-playlist"
 from spreadsheet_tags import TAG_AMAZON, TAG_SHEET, get_source, get_tag_display
 from utils import logger, setup_logging
-
-OUTPUT_DIR = "./output"
+from config import OUTPUT_DIR  # frozen build → per-user data dir; dev → ./output
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -11007,15 +11006,20 @@ _DB_EXTENSIONS = {".xlsx", ".json"}
 
 
 def _collect_output_files() -> list[str]:
-    """Return absolute paths of all exportable files in OUTPUT_DIR."""
+    """Return paths of all exportable files anywhere under OUTPUT_DIR
+    (recursively), so the full org-tree folder structure — not just the top
+    level — is captured by Export Database. Excel lock/temp files (``~$...``)
+    are skipped."""
     if not os.path.isdir(OUTPUT_DIR):
         return []
-    return sorted(
-        os.path.join(OUTPUT_DIR, f)
-        for f in os.listdir(OUTPUT_DIR)
-        if os.path.splitext(f)[1].lower() in _DB_EXTENSIONS
-        and os.path.isfile(os.path.join(OUTPUT_DIR, f))
-    )
+    out: list[str] = []
+    for dirpath, _dirs, files in os.walk(OUTPUT_DIR):
+        for f in files:
+            if f.startswith("~$"):
+                continue
+            if os.path.splitext(f)[1].lower() in _DB_EXTENSIONS:
+                out.append(os.path.join(dirpath, f))
+    return sorted(out)
 
 
 class ImportDatabaseDialog(QDialog):
@@ -11041,9 +11045,12 @@ class ImportDatabaseDialog(QDialog):
                     and os.path.splitext(info.filename)[1].lower() in _DB_EXTENSIONS
                 ]
             existing = {
-                os.path.basename(p) for p in _collect_output_files()
+                os.path.relpath(p, OUTPUT_DIR).replace(os.sep, "/")
+                for p in _collect_output_files()
             }
-            self._conflicts = [n for n in self._names if n in existing]
+            self._conflicts = [
+                n for n in self._names if n.replace("\\", "/") in existing
+            ]
             self._valid = True
         except Exception as exc:
             layout.addWidget(QLabel(f"Could not read archive:\n{exc}"))
@@ -11550,7 +11557,8 @@ Metadata, Filter, Duplicates, Curate, Create Playlist, Reconcile, …).</li>
 <h2>3. Export a playlist to a spreadsheet</h2>
 <ul>
 <li>Click <b>Export Playlist</b> (<b>Ctrl+E</b>), pick a playlist, and it's
-scraped to a styled <tt>.xlsx</tt> under <tt>./output/</tt>.</li>
+scraped to a styled <tt>.xlsx</tt> in your library folder (see
+&ldquo;Where your data lives&rdquo; below).</li>
 <li>Right-click a playlist inside a folder → <b>Export to spreadsheet…</b> to
 save it straight into that folder.</li>
 <li><b>Update</b> (in the detail view) re-scrapes an Amazon-tagged spreadsheet
@@ -11652,12 +11660,23 @@ from the spreadsheet, from Amazon, or from both (a failed Amazon delete never
 wipes the row).</li>
 </ul>
 
-<h2>13. Back up your library</h2>
+<h2>13. Back up &amp; transfer your library</h2>
 <ul>
-<li><b>File → Export Database…</b> (<b>Ctrl+Shift+E</b>) saves all spreadsheets
-and config to a <tt>.zip</tt>; <b>Import Database…</b> (<b>Ctrl+Shift+I</b>)
-restores them.</li>
+<li><b>File → Export Database…</b> (<b>Ctrl+Shift+E</b>) saves every spreadsheet
+<i>and</i> your full folder organization to a single <tt>.zip</tt>.</li>
+<li><b>File → Import Database…</b> (<b>Ctrl+Shift+I</b>) restores that
+<tt>.zip</tt> — folder structure and all — into this copy of the app. This is
+how you move your library and organization to another PC or a fresh install:
+Export on one, Import on the other.</li>
 </ul>
+
+<h2>Where your data lives</h2>
+<p>Your library (spreadsheets, the folder tree, and settings) is stored under a
+per-user data folder:
+<tt>%LOCALAPPDATA%\\AmazonMusicManager\\output</tt> on an installed copy. The
+Chrome sign-in session is kept separately in <tt>browser_data</tt>. Everything
+stays on your machine. To back up by hand, copy that <tt>output</tt> folder —
+or just use <b>Export Database</b>.</p>
 
 <h2>Keyboard shortcuts</h2>
 <ul>
@@ -12233,7 +12252,11 @@ class MainWindow(QMainWindow):
         try:
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for fpath in files:
-                    zf.write(fpath, arcname=os.path.basename(fpath))
+                    # Store the path relative to OUTPUT_DIR (forward slashes) so
+                    # the org-tree folder structure is recreated on import,
+                    # rather than flattening every file into one directory.
+                    arc = os.path.relpath(fpath, OUTPUT_DIR).replace(os.sep, "/")
+                    zf.write(fpath, arcname=arc)
             n = len(files)
             self._status.showMessage(
                 f"Exported {n} file(s) to {os.path.basename(path)}", 8000
@@ -12258,12 +12281,22 @@ class MainWindow(QMainWindow):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         imported = skipped = 0
         try:
+            out_root = os.path.abspath(OUTPUT_DIR)
             with zipfile.ZipFile(path, "r") as zf:
                 for name in names:
-                    dest = os.path.join(OUTPUT_DIR, name)
+                    dest = os.path.abspath(os.path.join(OUTPUT_DIR, name))
+                    # Zip-slip guard: never write outside OUTPUT_DIR.
+                    try:
+                        if os.path.commonpath([out_root, dest]) != out_root:
+                            skipped += 1
+                            continue
+                    except ValueError:
+                        skipped += 1
+                        continue
                     if os.path.exists(dest) and not overwrite:
                         skipped += 1
                         continue
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
                     with zf.open(name) as src, open(dest, "wb") as dst:
                         dst.write(src.read())
                     imported += 1

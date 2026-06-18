@@ -19,11 +19,17 @@ if (-not (Test-Path "dist\AmazonMusicManager\AmazonMusicManager.exe")) {
 }
 
 Write-Host "[2/2] Compiling the installer with Inno Setup..." -ForegroundColor Cyan
-$iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-if (-not (Test-Path $iscc)) {
-    # Fall back to ISCC on PATH.
+# ISCC.exe can live in Program Files (machine install) or LOCALAPPDATA
+# (winget's per-user install), so check both, then fall back to PATH.
+$isccCandidates = @(
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    "C:\Program Files\Inno Setup 6\ISCC.exe",
+    "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+)
+$iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $iscc) {
     if (Get-Command ISCC -ErrorAction SilentlyContinue) { $iscc = "ISCC" }
-    else { throw "Inno Setup (ISCC.exe) not found. Install Inno Setup 6 from https://jrsoftware.org/isdl.php" }
+    else { throw "Inno Setup (ISCC.exe) not found. Install Inno Setup 6 from https://jrsoftware.org/isdl.php (or: winget install JRSoftware.InnoSetup)" }
 }
 & $iscc installer.iss
 

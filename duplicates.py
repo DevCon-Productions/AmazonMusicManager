@@ -10,9 +10,10 @@ from difflib import SequenceMatcher
 from openpyxl import load_workbook
 
 from utils import normalize, logger
+from config import OUTPUT_DIR
 
 # File to persist dismissed duplicate groups
-_DISMISSED_FILE = "./output/dismissed_duplicates.json"
+_DISMISSED_FILE = os.path.join(OUTPUT_DIR, "dismissed_duplicates.json")
 
 
 def _load_dismissed() -> set[str]:

@@ -1,7 +1,25 @@
 import os
+import sys
 
 BASE_URL = "https://music.amazon.com"
 USER_DATA_DIR = os.path.join(os.path.dirname(__file__), "browser_data")
+
+# Where the app keeps its data — the ``output/`` tree (spreadsheets,
+# organization.json, caches, the web-restricted log). The INSTALLED (frozen)
+# build stores it in a per-user, always-writable location so the app works
+# even when installed under Program Files; running from source keeps the
+# original ``./output`` in the project directory so the dev workflow is
+# unchanged. All modules import OUTPUT_DIR from here so they never disagree.
+if getattr(sys, "frozen", False):
+    _data_base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    OUTPUT_DIR = os.path.join(_data_base, "AmazonMusicManager", "output")
+else:
+    OUTPUT_DIR = "./output"
+try:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+except OSError:
+    pass
+
 DEFAULT_TIMEOUT = 15_000   # 15s
 LONG_TIMEOUT = 30_000      # 30s
 LOGIN_TIMEOUT = 300_000    # 5 minutes for manual login

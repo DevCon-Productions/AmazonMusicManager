@@ -79,9 +79,12 @@ Build pieces, if you want to run them by hand:
 - **MusicBrainz metadata needs your VPN off** — it blocks many VPN exit nodes.
 - **Re-export after editing on Amazon.** The app reads cached spreadsheets, so
   re-export (or Update) a playlist after changing it on Amazon.
-- **Your data stays local.** Spreadsheets live under `output/`, and the Chrome
-  login session lives in `browser_data/` — both are git-ignored and never
-  leave your machine.
+- **Your data stays local.** Your library (spreadsheets + folder organization)
+  lives under `output/` — `./output` when running from source, or
+  `%LOCALAPPDATA%\AmazonMusicManager\output` in an installed build. The Chrome
+  login session lives in `browser_data/`. Move your library between machines
+  with **File → Export/Import Database** (a single `.zip` that preserves the
+  folder tree). Nothing leaves your machine.
 
 ---
 
