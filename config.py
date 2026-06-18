@@ -2,23 +2,28 @@ import os
 import sys
 
 BASE_URL = "https://music.amazon.com"
-USER_DATA_DIR = os.path.join(os.path.dirname(__file__), "browser_data")
 
-# Where the app keeps its data — the ``output/`` tree (spreadsheets,
-# organization.json, caches, the web-restricted log). The INSTALLED (frozen)
-# build stores it in a per-user, always-writable location so the app works
-# even when installed under Program Files; running from source keeps the
-# original ``./output`` in the project directory so the dev workflow is
-# unchanged. All modules import OUTPUT_DIR from here so they never disagree.
+# Data root — EVERY path the app writes (output tree, Chrome profile, log,
+# screenshots) derives from here, so nothing lands in a read-only install dir.
+# The INSTALLED (frozen) build uses a per-user, always-writable location so the
+# app works even when installed under Program Files; running from source uses
+# the project directory, so the dev workflow is unchanged. All modules import
+# these from here so they never disagree.
 if getattr(sys, "frozen", False):
     _data_base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    OUTPUT_DIR = os.path.join(_data_base, "AmazonMusicManager", "output")
+    DATA_DIR = os.path.join(_data_base, "AmazonMusicManager")
 else:
-    OUTPUT_DIR = "./output"
-try:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-except OSError:
-    pass
+    DATA_DIR = "."
+
+OUTPUT_DIR = os.path.join(DATA_DIR, "output")          # spreadsheets, org tree, caches
+USER_DATA_DIR = os.path.join(DATA_DIR, "browser_data")  # Chrome profile / login session
+LOG_FILE = os.path.join(DATA_DIR, "amazonmusic.log")
+SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
+for _d in (OUTPUT_DIR, USER_DATA_DIR, SCREENSHOT_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except OSError:
+        pass
 
 DEFAULT_TIMEOUT = 15_000   # 15s
 LONG_TIMEOUT = 30_000      # 30s

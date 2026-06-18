@@ -4,7 +4,7 @@ import socket
 import time
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-from config import USER_DATA_DIR, SLOW_MO
+from config import USER_DATA_DIR, SLOW_MO, SCREENSHOT_DIR
 from utils import logger
 
 
@@ -125,7 +125,7 @@ class BrowserManager:
 
     async def __aenter__(self):
         os.makedirs(USER_DATA_DIR, exist_ok=True)
-        os.makedirs("screenshots", exist_ok=True)
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
         chrome_path = _find_chrome_path()
         debug_port = await self._launch_chrome_with_retry(chrome_path)

@@ -1,6 +1,9 @@
 import asyncio
 import logging
+import os
 import re
+
+from config import LOG_FILE, SCREENSHOT_DIR
 
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
@@ -10,7 +13,9 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler("amazonmusic.log", encoding="utf-8"),
+            # Write under the per-user data dir, not the (possibly read-only)
+            # working/install directory.
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
         ],
     )
     return logging.getLogger("amazonmusic")
@@ -49,7 +54,7 @@ async def retry(coro_fn, retries: int = 3, delay: float = 2.0):
 async def screenshot_on_error(page, name: str = "error"):
     """Save a debug screenshot."""
     try:
-        path = f"screenshots/{name}.png"
+        path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
         await page.screenshot(path=path, full_page=True)
         logger.info("Screenshot saved to %s", path)
     except Exception:
