@@ -1,12 +1,16 @@
 ; Inno Setup script for Amazon Music Manager.
 ; Prerequisite: build the app first so dist\AmazonMusicManager\ exists:
 ;     pyinstaller --noconfirm AmazonMusicManager.spec
-; Then compile this script (produces installer_output\AmazonMusicManager-Setup-1.0.exe):
+; Then compile this script (produces installer_output\AmazonMusicManager-Setup-<version>.exe):
 ;     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 ; ...or open this file in the Inno Setup IDE and click Build.
 
 #define AppName "Amazon Music Manager"
-#define AppVersion "1.0"
+; AppVersion is passed by build_installer.ps1 (/DAppVersion=..., read from
+; version.py). The fallback below is only for compiling from the IDE.
+#ifndef AppVersion
+  #define AppVersion "0.0"
+#endif
 #define AppPublisher "DevCon Productions"
 #define AppExeName "AmazonMusicManager.exe"
 
@@ -31,6 +35,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; Installs into Program Files, so admin rights are requested.
 PrivilegesRequired=admin
 UninstallDisplayIcon={app}\{#AppExeName}
+; In-app updates run this installer with /SILENT while the app is closing;
+; let Restart Manager close it if it is still running.
+CloseApplications=yes
+RestartApplications=no
+VersionInfoVersion={#AppVersion}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -49,3 +58,5 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; After a silent in-app update, relaunch the app (as the normal user, not admin).
+Filename: "{app}\{#AppExeName}"; Flags: nowait runasoriginaluser skipifnotsilent

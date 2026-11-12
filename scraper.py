@@ -204,31 +204,20 @@ async def scrape_playlist(page: Page, playlist_url: str | None = None, playlist_
     else:
         raise ValueError("Provide either playlist_url or playlist_name")
 
-    # Wait for the playlist page to fully load
+    # Wait for the playlist page to fully load. Since the Nov 2026 redesign
+    # (React Native Web) track rows are `div[class*=selectionRow]`; the
+    # playlist data itself lives in React props (see _read_playlist_data).
     logger.info("Waiting for playlist page to fully load...")
-    # First wait for the detail header to appear (indicates playlist page is rendering)
     try:
-        await page.wait_for_selector(
-            SELECTORS["playlist_header"], state="attached", timeout=LONG_TIMEOUT
-        )
-        logger.info("Playlist header detected")
+        await page.wait_for_selector(_ROW_SELECTOR, state="attached", timeout=LONG_TIMEOUT)
+        logger.info("Track rows detected")
     except Exception:
-        logger.warning("Timed out waiting for playlist header")
-    # Then wait for track rows with actual data attributes
-    try:
-        await page.wait_for_selector(
-            'music-image-row[primary-text]', state="attached", timeout=LONG_TIMEOUT
-        )
-        logger.info("Track rows with data detected")
-    except Exception:
-        logger.warning("Timed out waiting for track rows with data")
-    # Extra settle time for the virtual list to fully populate
-    await page.wait_for_timeout(5000)
+        logger.warning("Timed out waiting for track rows (url=%s)", page.url)
+    await page.wait_for_timeout(1500)
 
-    # Grab the playlist title from the music-detail-header element
-    name = await _get_playlist_title(page) or playlist_name or "Unnamed Playlist"
+    data = await _read_playlist_data(page)
+    name = (data or {}).get("title") or playlist_name or "Unnamed Playlist"
 
-    # Scroll through the virtualized list to collect all tracks
     songs = await _collect_all_tracks(page)
     logger.info("Scraped %d tracks from '%s'", len(songs), name)
 
@@ -282,161 +271,139 @@ async def _navigate_to_playlist_by_name(page: Page, name: str):
     await page.goto(full_url, wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
 
 
-async def _get_playlist_title(page: Page) -> str | None:
-    """Extract playlist name from the music-detail-header element."""
-    # Try the headline attribute first
-    title = await page.evaluate("""() => {
-        const headers = document.querySelectorAll('music-detail-header');
-        for (const h of headers) {
-            // Check headline attribute
-            const hl = h.getAttribute('headline');
-            if (hl) return hl;
-            // Check for h1 inside (or in shadow DOM)
-            const h1 = h.querySelector('h1');
-            if (h1) return h1.textContent.trim();
-            // Try shadow root
-            if (h.shadowRoot) {
-                const sh1 = h.shadowRoot.querySelector('h1');
-                if (sh1) return sh1.textContent.trim();
-            }
+# ---------------------------------------------------------------------------
+# Playlist track collection (redesigned site, Nov 2026)
+#
+# The web player is now React Native Web: no music-* components, no ASINs in
+# the DOM. But every track row's React fiber carries the page's GraphQL
+# `playlistRef` object, whose `tracks.edges[i].node` has the track ASIN,
+# full title, duration (seconds), album {id, shortTitle} and
+# contributingArtists. Edges accumulate as the list scrolls (100 per page,
+# `pageInfo.hasNextPage`), so we scroll until edges == totalCount.
+# ---------------------------------------------------------------------------
+_ROW_SELECTOR = '[class*="selectionRow"]'
+
+_READ_PLAYLIST_JS = r"""() => {
+    const rows = document.querySelectorAll('[class*="selectionRow"]');
+    let pr = null;
+    for (const r of rows) {
+        const fk = Object.keys(r).find(k => k.startsWith('__reactFiber'));
+        let f = fk ? r[fk] : null;
+        for (let i = 0; i < 30 && f; i++, f = f.return) {
+            const p = f.memoizedProps;
+            if (p && p.playlistRef && p.playlistRef.tracks) { pr = p.playlistRef; break; }
         }
-        // Fallback: any h1 on the page
-        const h1 = document.querySelector('h1');
-        if (h1) return h1.textContent.trim();
-        return null;
-    }""")
-    return title
+        if (pr) break;
+    }
+    if (!pr) return null;
+    const t = pr.tracks;
+    const tracks = (t.edges || []).map(e => {
+        const n = (e && e.node) || {};
+        const artists = ((n.contributingArtists || {}).edges || [])
+            .map(a => a && a.node && a.node.name).filter(Boolean);
+        return {
+            asin: n.id || '',
+            title: n.title || n.shortTitle || '',
+            artists,
+            album: (n.album && (n.album.title || n.album.shortTitle)) || '',
+            album_asin: (n.album && n.album.id) || '',
+            duration: typeof n.duration === 'number' ? n.duration : null,
+        };
+    });
+    return {
+        title: pr.title || '',
+        total: (t.totalCount ?? pr.trackCount ?? null),
+        hasNext: !!(t.pageInfo && t.pageInfo.hasNextPage),
+        tracks,
+    };
+}"""
+
+_SCROLL_TO_END_JS = r"""() => {
+    const rows = document.querySelectorAll('[class*="selectionRow"]');
+    let s = rows.length ? rows[rows.length - 1] : null;
+    while (s && s !== document.body) {
+        const cs = getComputedStyle(s);
+        if (/(auto|scroll)/.test(cs.overflowY) && s.scrollHeight > s.clientHeight + 10) break;
+        s = s.parentElement;
+    }
+    if (!s || s === document.body) { window.scrollTo(0, document.body.scrollHeight); return; }
+    s.scrollTop = s.scrollHeight;
+}"""
+
+
+def _join_artists(names: list[str]) -> str:
+    """Match the site's display format: 'A', 'A & B', 'A, B & C'."""
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return ", ".join(names[:-1]) + " & " + names[-1]
+
+
+def _format_duration(seconds) -> str:
+    if not isinstance(seconds, (int, float)) or seconds <= 0:
+        return ""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+_EXPLICIT_SUFFIX_RE = re.compile(r"\s*\[Explicit\]\s*$", re.IGNORECASE)
+
+
+def _track_to_song(t: dict) -> Song:
+    return Song(
+        # Old exports showed titles without the "[Explicit]" tag (it was a
+        # badge); strip it so refreshed rows look like the existing ones.
+        title=_EXPLICIT_SUFFIX_RE.sub("", t.get("title") or ""),
+        artist=_join_artists(t.get("artists") or []),
+        album=t.get("album") or "",
+        duration=_format_duration(t.get("duration")),
+        asin=t.get("asin") or "",
+        album_asin=t.get("album_asin") or "",
+    )
+
+
+async def _read_playlist_data(page: Page) -> dict | None:
+    try:
+        return await page.evaluate(_READ_PLAYLIST_JS)
+    except Exception as e:
+        logger.warning("Could not read playlist data from page: %s", e)
+        return None
 
 
 async def _collect_all_tracks(page: Page) -> list[Song]:
-    """Collect all tracks from the playlist.
+    """Collect every track of the open playlist, in playlist order."""
+    data = await _read_playlist_data(page)
+    if data is None:
+        logger.warning("No playlist data found on page (url=%s)", page.url)
+        return []
 
-    Amazon Music virtualizes the track list: rows above/below the viewport
-    can be unloaded from the DOM as the user scrolls. So we can't rely on
-    'rows in DOM' as a 'total songs seen' proxy — we identify each row by
-    (title, artist, album) and collect unique keys across batches.
-
-    Loop exits after several consecutive batches produce no NEW unique songs,
-    giving slow-loading batches time to catch up instead of quitting on the
-    first stall.
-    """
-    songs: list[Song] = []
-    seen_keys: set[tuple[str, str, str]] = set()
-
-    # Find the list container (div with overflow:auto that wraps track rows)
-    list_container = await page.evaluate_handle("""() => {
-        const row = document.querySelector('music-image-row[primary-text]');
-        if (!row) return null;
-        let el = row.parentElement;
-        while (el && el !== document.body) {
-            const inlineStyle = el.getAttribute('style') || '';
-            if (inlineStyle.includes('overflow') && inlineStyle.includes('will-change')) {
-                return el;
-            }
-            el = el.parentElement;
-        }
-        return null;
-    }""")
-
-    stale_batches = 0
-    STALE_LIMIT = 4  # exit after this many consecutive empty batches
-    MAX_BATCHES = 60
-
-    for batch in range(MAX_BATCHES):
-        rows = await page.evaluate("""() => {
-            // Track duration is NOT in any music-image-row attribute — it
-            // lives in a descendant <span> with text matching MM:SS or
-            // H:MM:SS (no class, parent has class="hydrated"). Recon
-            // 2026-06-03 (smoke_playlist_row_duration_recon.py) found
-            // exactly one match per row on the playlist page; we take the
-            // FIRST match defensively in case future Amazon DOM changes
-            // add others.
-            const DUR_RE = /^(?:\\d{1,2}:)?\\d{1,2}:\\d{2}$/;
-            const rows = document.querySelectorAll('music-image-row[primary-text]');
-            const results = [];
-            for (const row of rows) {
-                const title = row.getAttribute('primary-text') || '';
-                const artist = row.getAttribute('secondary-text-1') || '';
-                const album = row.getAttribute('secondary-text-2') || '';
-                const href = row.getAttribute('primary-href') || '';
-                let duration = '';
-                if (title) {
-                    const spans = row.querySelectorAll('span');
-                    for (const s of spans) {
-                        if (s.children.length !== 0) continue;
-                        const t = (s.textContent || '').trim();
-                        if (DUR_RE.test(t)) {
-                            duration = t;
-                            break;
-                        }
-                    }
-                    results.push({ title, artist, album, href, duration });
-                }
-            }
-            return results;
-        }""")
-
-        new_added = 0
-        for item in rows:
-            asin, album_asin = _parse_asins_from_href(item.get("href", ""))
-            # ASIN included in the dedup key so different recordings of the
-            # same movement (e.g. Berliner Philharmoniker under Karajan vs
-            # Abbado playing Mahler 5 mvt I, where title/artist/album display
-            # strings can collide while ASINs differ) don't silently drop.
-            key = (asin, item["title"], item["artist"], item["album"])
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            songs.append(Song(
-                title=item["title"],
-                artist=item["artist"],
-                album=item["album"],
-                duration=item.get("duration", ""),
-                asin=asin,
-                album_asin=album_asin,
-            ))
-            new_added += 1
-
-        if new_added > 0:
-            stale_batches = 0
-        else:
-            stale_batches += 1
-
-        logger.info("Batch %d: +%d new unique, %d total (%d rows in DOM, stale=%d/%d)",
-                     batch + 1, new_added, len(songs), len(rows),
-                     stale_batches, STALE_LIMIT)
-
-        if stale_batches >= STALE_LIMIT:
-            logger.info("No new songs in %d consecutive batches — done", stale_batches)
+    stale = 0
+    STALE_LIMIT = 4
+    last_n = len(data["tracks"])
+    for batch in range(200):  # 200 pages × 100 = far above any real playlist
+        total = data.get("total")
+        n = len(data["tracks"])
+        logger.info("Batch %d: %d of %s tracks loaded", batch + 1, n, total if total is not None else "?")
+        if (total is not None and n >= total) or (not data.get("hasNext") and n > 0 and stale >= 1):
             break
+        await page.evaluate(_SCROLL_TO_END_JS)
+        await page.wait_for_timeout(1500 + stale * 2000)
+        data = await _read_playlist_data(page) or data
+        if len(data["tracks"]) > last_n:
+            last_n = len(data["tracks"])
+            stale = 0
+        else:
+            stale += 1
+            if stale >= STALE_LIMIT:
+                logger.warning("Track loading stalled at %d of %s", last_n, total)
+                break
 
-        # Scroll to the very bottom of the list to trigger loading the next batch.
-        # Use multiple strategies since the container's scroll behavior is unusual.
-
-        last_row = await page.query_selector('music-image-row[primary-text]:last-of-type')
-        if last_row:
-            await last_row.scroll_into_view_if_needed()
-
-        await page.wait_for_timeout(1000)
-
-        is_null = await list_container.evaluate("el => el === null")
-        if not is_null:
-            await list_container.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-
-        await page.keyboard.press("End")
-        await page.wait_for_timeout(1000)
-
-        viewport = page.viewport_size
-        if viewport:
-            await page.mouse.wheel(0, 5000)
-
-        # Escalating wait: give Amazon's lazy loader more time when batches
-        # stall, since the stall may just be a slow network response.
-        base_wait = 5000
-        wait_ms = base_wait + stale_batches * 3000  # 5s, 8s, 11s, 14s
-        await page.wait_for_timeout(wait_ms)
-
-    logger.info("Collection complete: %d total unique songs", len(songs))
+    songs = [_track_to_song(t) for t in data["tracks"] if t.get("title")]
+    total = data.get("total")
+    if total is not None and len(songs) < total:
+        logger.warning("Collected %d of %d tracks (some may be unavailable)", len(songs), total)
+    logger.info("Collection complete: %d total songs", len(songs))
     return songs
 
 

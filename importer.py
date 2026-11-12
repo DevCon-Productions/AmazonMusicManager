@@ -119,6 +119,110 @@ async def create_playlist_from_songs(
     return {"added": added, "skipped": skipped, "results": results}
 
 
+# ---------------------------------------------------------------------------
+# Adding tracks / creating playlists — redesigned site (Nov 2026)
+#
+# The web player is React Native Web; everything is addressed by
+# data-testid, and ASINs live in React props rather than the DOM:
+#   album page row      [data-playback-engage-region]   (fiber prop edgeRef.id = track ASIN)
+#   row ⋯ button        [data-testid*="AlbumTrackEdge_ContextMenu"]
+#   menu item           [data-testid="OverflowMenu_Option_AddToPlaylist"]
+#   picker              [data-testid="AddToPlaylistModal"], items
+#                       [data-testid^="AddToPlaylist_Item_"] with a
+#                       [data-testid="PlaylistItem_Title"]; 10 per page,
+#                       more load as its list scrolls
+#   create (library)    LibraryPlaylists_NewPlaylistButton ->
+#                       CreatePlaylist_TextInput -> CreatePlaylist_SaveButton
+# The ?trackAsin= deep link no longer highlights the track, so the row is
+# found by matching the ASIN in its React props.
+# ---------------------------------------------------------------------------
+_ALBUM_ROW = "[data-playback-engage-region]"
+_ROW_MORE_BTN = '[data-testid*="AlbumTrackEdge_ContextMenu"]'
+_MENU_ADD = '[data-testid="OverflowMenu_Option_AddToPlaylist"]'
+_MENU_ANY = '[data-testid^="OverflowMenu_Option_"]'
+_PICKER = '[data-testid="AddToPlaylistModal"]'
+
+# Marks the album row whose track ASIN matches with data-amm-target="1" and
+# returns its 1-based row index, or 0 when it isn't rendered (yet).
+_MARK_ROW_JS = r"""(asin) => {
+    document.querySelectorAll('[data-amm-target]').forEach(e => e.removeAttribute('data-amm-target'));
+    const rows = document.querySelectorAll('[data-playback-engage-region]');
+    for (let idx = 0; idx < rows.length; idx++) {
+        const r = rows[idx];
+        const fk = Object.keys(r).find(k => k.startsWith('__reactFiber'));
+        let f = fk ? r[fk] : null;
+        for (let i = 0; i < 12 && f; i++, f = f.return) {
+            const p = f.memoizedProps;
+            if (!p) continue;
+            for (const key of ['edgeRef', 'trackRef', 'track']) {
+                const v = p[key];
+                const id = v && (v.id || (v.node && v.node.id));
+                if (id === asin) { r.setAttribute('data-amm-target', '1'); return idx + 1; }
+            }
+        }
+    }
+    return 0;
+}"""
+
+_SCROLL_PAGE_JS = r"""(dy) => {
+    const rows = document.querySelectorAll('[data-playback-engage-region]');
+    let s = rows.length ? rows[rows.length - 1] : null;
+    while (s && s !== document.body) {
+        const cs = getComputedStyle(s);
+        if (/(auto|scroll)/.test(cs.overflowY) && s.scrollHeight > s.clientHeight + 10) break;
+        s = s.parentElement;
+    }
+    if (!s || s === document.body) { const y = window.scrollY; window.scrollBy(0, dy); return window.scrollY - y; }
+    const before = s.scrollTop; s.scrollTop = before + dy; return s.scrollTop - before;
+}"""
+
+# Marks the picker item whose title equals *name* (case-insensitive) with
+# data-amm-pick="1"; otherwise scrolls the list to load more. Returns
+# {found, count}.
+_PICKER_FIND_JS = r"""(name) => {
+    const want = name.trim().toLowerCase();
+    const m = document.querySelector('[data-testid="AddToPlaylistModal"]');
+    if (!m) return {found: false, count: -1};
+    const items = m.querySelectorAll('[data-testid^="AddToPlaylist_Item_"]');
+    for (const it of items) {
+        const t = it.querySelector('[data-testid="PlaylistItem_Title"]');
+        const txt = ((t && (t.getAttribute('aria-label') || t.textContent)) || '').trim().toLowerCase();
+        if (txt === want) { it.setAttribute('data-amm-pick', '1'); return {found: true, count: items.length}; }
+    }
+    let sc = m.querySelector('[data-testid="AddToPlaylist_RecentsList"]') || m;
+    while (sc && sc !== m.parentElement &&
+           !(sc.scrollHeight > sc.clientHeight + 10 && /(auto|scroll)/.test(getComputedStyle(sc).overflowY)))
+        sc = sc.parentElement;
+    if (sc) sc.scrollTop = sc.scrollHeight;
+    return {found: false, count: items.length};
+}"""
+
+
+async def _dismiss_overlays(page: Page) -> None:
+    for _ in range(2):
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+
+async def _find_album_row(page: Page, track_asin: str):
+    """Scroll the album page until the row for *track_asin* is rendered.
+
+    Returns a Locator for it, or None.
+    """
+    for attempt in range(60):  # long box sets render rows lazily
+        idx = await page.evaluate(_MARK_ROW_JS, track_asin)
+        if idx:
+            return page.locator('[data-amm-target="1"]').first
+        moved = await page.evaluate(_SCROLL_PAGE_JS, 900)
+        await page.wait_for_timeout(600)
+        if not moved and attempt > 2:
+            break
+    return None
+
+
 async def add_track_by_asin(
     page: Page,
     album_asin: str,
@@ -132,30 +236,16 @@ async def add_track_by_asin(
     source_artist: str = "",
     source_album: str = "",
 ) -> bool:
-    """Add a single track to *playlist_name* via the Amazon-Music deep-link.
+    """Add a single track to *playlist_name*, addressed by its exact ASIN.
 
-    Navigates to ``/albums/<album_asin>?trackAsin=<track_asin>`` — Amazon
-    renders the album page with the target track scrolled into view —
-    then opens that row's 3-dot menu and picks the playlist by name.
+    Opens the album page, finds the track's row by the ASIN in its React
+    props, opens the row's menu -> "Add to Playlist", and picks the
+    playlist by name in the picker.
 
-    Why this exists (vs. search-based add): for Classical recordings,
-    Amazon's Songs search results expose only (title, artist) — NOT album
-    — so `score_match` can't distinguish recordings with the same title.
-    The deep link sidesteps search entirely and addresses the exact ASIN.
-
-    Returns True on success. On failure (track not found on album page,
-    "Add to playlist" not in menu, playlist not in picker) returns False
-    and dismisses any open menus.
-
-    The optional ``source_*`` kwargs describe where *track_asin* came from
-    in the user's library (which playlist, which row, what title). They
-    are used only when the picker reports ``"menu_hidden"`` — Amazon's web
-    player is hiding the "Add to playlist" item for the track, which is
-    the 2026-06-12 web-restriction symptom. In that case the track is
-    recorded in ``web_restricted`` so the pool builder excludes the
-    surrounding performance on subsequent generator runs. Callers without
-    source metadata (e.g. ad-hoc adds) can omit the kwargs; the recording
-    step quietly no-ops without ``source_playlist_url``.
+    The ``source_*`` kwargs describe where *track_asin* came from; they're
+    used only when the menu opens without an "Add to Playlist" item —
+    Amazon hides it for some web-restricted tracks — so the track is
+    recorded in ``web_restricted`` and later runs skip it.
     """
     if not album_asin or not track_asin:
         logger.warning("add_track_by_asin: missing ASIN(s) — album=%r track=%r", album_asin, track_asin)
@@ -168,152 +258,21 @@ async def add_track_by_asin(
     logger.info("add_track_by_asin: navigating to %s", url)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
+        await page.wait_for_selector(_ALBUM_ROW, state="attached", timeout=LONG_TIMEOUT)
     except Exception as e:
-        logger.error("add_track_by_asin: navigation failed: %s", e)
+        logger.warning("add_track_by_asin: album page did not load (%s): %s", url, e)
+        await screenshot_on_error(page, "album_not_loaded")
         return False
-
-    # Album pages render tracks as <music-text-row> (NOT <music-image-row>
-    # as playlist pages do). The ?trackAsin= deep-link adds class="focused"
-    # to the matching row, so we wait for that to appear — both confirms
-    # the tracklist has loaded AND identifies the correct row. ASINs are
-    # NOT exposed anywhere in the album-page DOM (verified via recon
-    # 2026-06-03: no element attribute, innerText, or JS property carries
-    # the trackAsin), so the focused-class is the only ASIN-level handle.
-    try:
-        await page.wait_for_selector(
-            'music-text-row[focused]', state="attached", timeout=LONG_TIMEOUT
-        )
-    except Exception:
-        logger.warning(
-            "add_track_by_asin: focused row never appeared on %s — "
-            "deep-link may have failed or the album's tracklist is "
-            "still loading", url,
-        )
-        await screenshot_on_error(page, "album_no_focused_row")
-        return False
-
-    # Brief settle to let the focused row finish painting and the
-    # auto-scroll-into-view animation complete.
-    await page.wait_for_timeout(1500)
-
-    row_handle = await page.evaluate_handle("""() => {
-        const rows = document.querySelectorAll('music-text-row[focused]');
-        // Should be exactly one — but in case the picker matched
-        // multiple (shouldn't happen for a real ASIN), take the first.
-        return rows.length ? rows[0] : null;
-    }""")
-
-    is_null = await row_handle.evaluate("el => el === null")
-    if is_null:
-        logger.warning(
-            "add_track_by_asin: focused row vanished between wait and "
-            "lookup on album %s (track %s)", album_asin, track_asin,
-        )
-        await screenshot_on_error(page, "track_row_missing")
-        return False
-
-    # Scroll, hover, click 3-dot — same pre-menu choreography as
-    # _add_song_to_playlist. Duplicated here (a small block) rather than
-    # extracted; row-finding logic differs upstream so a shared wrapper
-    # adds little.
-    await row_handle.evaluate("el => el.scrollIntoView({ block: 'center', inline: 'center' })")
     await page.wait_for_timeout(1000)
 
-    box = await row_handle.bounding_box()
-    if not box:
-        logger.warning("add_track_by_asin: matched row has no bounding box")
+    row = await _find_album_row(page, track_asin)
+    if row is None:
+        logger.warning("add_track_by_asin: track %s not found on album %s", track_asin, album_asin)
+        await screenshot_on_error(page, f"track_row_missing_{track_asin}")
         return False
 
-    await page.mouse.move(box["x"] + box["width"] - 30, box["y"] + box["height"] / 2)
-    await page.wait_for_timeout(1000)
+    status = await _open_menu_and_pick(page, row, playlist_name, debug_tag=track_asin)
 
-    more_clicked = await _click_more_button(page, row_handle)
-    menu_opener = "3-dot" if more_clicked else "right-click"
-    if not more_clicked:
-        logger.info(
-            "add_track_by_asin: 3-dot not found for track %s — falling "
-            "back to right-click", track_asin,
-        )
-        await page.mouse.click(
-            box["x"] + box["width"] / 2, box["y"] + box["height"] / 2,
-            button="right",
-        )
-
-    # Poll for menu appearance instead of a fixed 2s wait. Records when
-    # (if ever) music-list-item shows up so the next failure tells us
-    # 'click never opened menu' vs 'menu opened+closed before our find'.
-    async def _wait_for_menu(max_ms: int) -> int:
-        elapsed = 0
-        while elapsed < max_ms:
-            await page.wait_for_timeout(250)
-            elapsed += 250
-            try:
-                count = await page.evaluate(
-                    "() => document.querySelectorAll('music-list-item').length"
-                )
-            except Exception:
-                count = 0
-            if count and count > 0:
-                return elapsed
-        return -1
-
-    menu_seen_at_ms = await _wait_for_menu(3000)
-    if menu_seen_at_ms >= 0:
-        logger.info(
-            "add_track_by_asin: menu appeared at %dms after %s for "
-            "track %s", menu_seen_at_ms, menu_opener, track_asin,
-        )
-    else:
-        # 2026-06-14: the 3-dot JS-click on Beethoven 8 mvt III rows
-        # returns 'found_direct' but Amazon's React handler doesn't open
-        # a menu in response. User confirmed right-click manually shows
-        # "Add to Playlist" on the same row. Retry with a real Playwright
-        # right-click (a fresh bounding-box query in case the page
-        # scrolled since the original hover) before giving up.
-        logger.warning(
-            "add_track_by_asin: menu did not appear in 3000ms after "
-            "%s click for track %s — retrying with right-click",
-            menu_opener, track_asin,
-        )
-        try:
-            # Dismiss any stale overlay just in case.
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(500)
-            retry_box = await row_handle.bounding_box()
-            if retry_box:
-                await page.mouse.click(
-                    retry_box["x"] + retry_box["width"] / 2,
-                    retry_box["y"] + retry_box["height"] / 2,
-                    button="right",
-                )
-                menu_opener = f"{menu_opener}+rclick_retry"
-                menu_seen_at_ms = await _wait_for_menu(3000)
-                if menu_seen_at_ms >= 0:
-                    logger.info(
-                        "add_track_by_asin: menu appeared at %dms after "
-                        "right-click retry for track %s",
-                        menu_seen_at_ms, track_asin,
-                    )
-                else:
-                    logger.warning(
-                        "add_track_by_asin: menu STILL did not appear "
-                        "after right-click retry for track %s",
-                        track_asin,
-                    )
-            else:
-                logger.warning(
-                    "add_track_by_asin: row had no bounding box on "
-                    "right-click retry for track %s", track_asin,
-                )
-        except Exception:
-            logger.exception(
-                "add_track_by_asin: right-click retry raised "
-                "(non-fatal, continuing)"
-            )
-
-    status = await _open_add_to_playlist_picker_and_pick(
-        page, playlist_name, debug_tag=track_asin, menu_opener=menu_opener,
-    )
     if status == "menu_hidden" and source_playlist_url:
         try:
             import web_restricted
@@ -328,530 +287,163 @@ async def add_track_by_asin(
                 substituted_asin="",
             )
             logger.info(
-                "add_track_by_asin: recorded web-restricted track "
-                "%s (album %s) — source playlist=%s row=%s",
-                track_asin, album_asin, source_playlist_name,
-                source_row_index,
+                "add_track_by_asin: recorded web-restricted track %s (album %s) "
+                "— source playlist=%s row=%s",
+                track_asin, album_asin, source_playlist_name, source_row_index,
             )
         except Exception:
-            logger.exception(
-                "add_track_by_asin: web_restricted.add failed "
-                "(non-fatal, continuing)"
-            )
+            logger.exception("add_track_by_asin: web_restricted.add failed (non-fatal)")
     return status == ""
 
 
-async def _create_empty_playlist(page: Page, name: str):
-    """Navigate to the playlist page and create a new empty playlist.
+async def _open_menu_and_pick(page: Page, row, playlist_name: str, *, debug_tag: str = "") -> str:
+    """Open *row*'s menu, choose "Add to Playlist", pick *playlist_name*.
 
-    Flow: Click "Create Playlist" → native-click "Curate a playlist" →
-    fill name input → click "Save".
+    Returns "" on success, "menu_hidden" when the menu opened without an
+    "Add to Playlist" item (web-restriction signal), "menu_failed" when no
+    menu opened, or "picker_failed" when the playlist wasn't in the picker.
     """
-    logger.info("Creating new playlist '%s'", name)
-
-    await page.goto(f"{BASE_URL}/my/playlists/all", wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
-    await page.wait_for_timeout(3000)
-
-    # Step 1: Click "Create Playlist" button
-    clicked = await page.evaluate("""() => {
-        const els = document.querySelectorAll('music-button, button, a, [role="button"]');
-        for (const el of els) {
-            const text = (el.textContent || '').trim().toLowerCase();
-            if (text.includes('create playlist')) {
-                el.click();
-                return true;
-            }
-        }
-        return false;
-    }""")
-
-    if not clicked:
-        logger.warning("Could not find Create Playlist button")
-        print(f"\n  Could not find Create Playlist button. Please create \"{name}\" manually.")
-        input("  Press Enter when ready to continue...")
-        return
-
-    logger.info("Clicked Create Playlist button")
-    await page.wait_for_timeout(3000)
-
-    # Step 2: Native-click "Curate a playlist" in the dialog
-    # Must use Playwright's real mouse click — JS .click() doesn't work here
-    curate_handle = await page.evaluate_handle("""() => {
-        const d = document.querySelector('[role="dialog"], [aria-modal="true"]');
-        if (!d) return null;
-        const rows = d.querySelectorAll('music-image-row');
-        for (const row of rows) {
-            const pt = (row.getAttribute('primary-text') || '').toLowerCase();
-            if (pt.includes('curate')) return row;
-        }
-        return null;
-    }""")
-
-    is_null = await curate_handle.evaluate("el => el === null")
-    if is_null:
-        logger.warning("Could not find 'Curate a playlist' option")
-        print(f"\n  Could not find 'Curate a playlist' option. Please create \"{name}\" manually.")
-        input("  Press Enter when ready to continue...")
-        return
-
-    box = await curate_handle.bounding_box()
-    if box:
-        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-        logger.info("Clicked 'Curate a playlist'")
-    else:
-        logger.warning("No bounding box for Curate option")
-        return
-
-    await page.wait_for_timeout(3000)
-
-    # Step 3: Fill in the playlist name
-    name_input = await page.query_selector('input[placeholder*="Playlist" i]')
-    if not name_input:
-        # Broader search
-        name_input = await page.query_selector('[role="dialog"] input[type="text"]')
-
-    if name_input:
-        await name_input.fill("")
-        await name_input.type(name, delay=30)
-        logger.info("Entered playlist name: '%s'", name)
-        await page.wait_for_timeout(500)
-    else:
-        logger.warning("Could not find name input — typing with keyboard")
-        await page.keyboard.type(name, delay=30)
-
-    # Step 4: Click "Save"
-    save_btn = await page.query_selector('[role="dialog"] music-button:has-text("Save")')
-    if not save_btn:
-        # Broader: find any button with "Save" text in the dialog
-        save_handle = await page.evaluate_handle("""() => {
-            const d = document.querySelector('[role="dialog"], [aria-modal="true"]');
-            if (!d) return null;
-            const btns = d.querySelectorAll('music-button, button');
-            for (const btn of btns) {
-                const text = (btn.textContent || '').trim().toLowerCase();
-                if (text === 'save') return btn;
-            }
-            return null;
-        }""")
-        is_null = await save_handle.evaluate("el => el === null")
-        if not is_null:
-            save_btn = save_handle
-
-    if save_btn:
-        box = await save_btn.bounding_box()
-        if box:
-            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            logger.info("Clicked Save button")
-        else:
-            await save_btn.click()
-    else:
-        logger.warning("Could not find Save button — pressing Enter")
-        await page.keyboard.press("Enter")
-
-    await page.wait_for_timeout(3000)
-    logger.info("Playlist '%s' created successfully", name)
-
-
-async def _add_song_to_playlist(page: Page, candidate, playlist_name: str) -> bool:
-    """Add a song from search results to a playlist.
-
-    Instead of trying to interact with the search result element directly
-    (which may scroll off in a horizontal shoveler), we use the search result's
-    index to re-find and interact with it on the current page.
-    """
-    try:
-        title = candidate.title
-        artist = candidate.artist
-
-        # Re-find the element on the page by matching title + artist
-        # Search results are music-horizontal-item elements in the Songs shoveler
-        row_handle = await page.evaluate_handle("""(args) => {
-            const [title, artist] = args;
-
-            // First check music-horizontal-item (search results)
-            const items = document.querySelectorAll('music-horizontal-item');
-            for (const item of items) {
-                const pt = item.getAttribute('primary-text') || '';
-                const st = item.getAttribute('secondary-text') || '';
-                if (pt === title && st === artist) return item;
-            }
-
-            // Fallback: check music-image-row (playlist page results)
-            const rows = document.querySelectorAll('music-image-row');
-            for (const row of rows) {
-                const pt = row.getAttribute('primary-text') || '';
-                const st = row.getAttribute('secondary-text-1') || '';
-                if (pt === title && st === artist) return row;
-            }
-
-            return null;
-        }""", [title, artist])
-
-        is_null = await row_handle.evaluate("el => el === null")
-        if is_null:
-            logger.warning("Could not re-find '%s' by '%s' on page", title, artist)
-            return False
-
-        # Scroll the element into view
-        await row_handle.evaluate("el => el.scrollIntoView({ block: 'center', inline: 'center' })")
-        await page.wait_for_timeout(1000)
-
-        # Get bounding box
-        box = await row_handle.bounding_box()
-        if not box:
-            logger.warning("Element has no bounding box after scroll")
-            return False
-
-        # Hover over the row to reveal the 3-dot menu button
-        await page.mouse.move(box["x"] + box["width"] - 30, box["y"] + box["height"] / 2)
-        await page.wait_for_timeout(1000)
-
-        # Try clicking the 3-dot (more) button within this row
-        more_clicked = await _click_more_button(page, row_handle)
-
-        if not more_clicked:
-            # Try right-clicking as fallback
-            logger.debug("3-dot button not found, trying right-click")
-            await page.mouse.click(
-                box["x"] + box["width"] / 2, box["y"] + box["height"] / 2,
-                button="right"
-            )
-
-        await page.wait_for_timeout(2000)
-        status = await _open_add_to_playlist_picker_and_pick(page, playlist_name)
-        return status == ""
-
-    except Exception as e:
-        logger.error("Failed to add song to playlist: %s", e)
-        await screenshot_on_error(page, "add_song_error")
-        try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
-        return False
-
-
-async def _open_add_to_playlist_picker_and_pick(
-    page: Page, playlist_name: str,
-    *, debug_tag: str = "", menu_opener: str = "",
-) -> str:
-    """After the row's 3-dot context menu is open, click "Add to playlist",
-    then find and click *playlist_name* in the resulting picker.
-
-    Shared between the search-based `_add_song_to_playlist` and the
-    ASIN-direct `add_track_by_asin` flows — same picker, same JS selectors,
-    same scroll-and-retry loop. Pre-condition: the context menu (containing
-    an "Add to playlist" item) is visible. On exit (success or failure)
-    the menu/picker is dismissed.
-
-    Returns a status code:
-
-      ``""``               — success
-      ``"menu_hidden"``    — "Add to playlist" item not present in the
-                             context menu. This is the new web-restriction
-                             symptom (2026-06-12): for some track ASINs
-                             Amazon hides the menu item entirely on the web
-                             player — a separate failure mode from the
-                             silent ASIN substitution detected at click
-                             time. Callers with source-track metadata
-                             should persist the track to
-                             ``web_restricted`` so the pool filter excludes
-                             it on subsequent generator runs.
-      ``"picker_failed"``  — Add-to-playlist menu opened but the target
-                             playlist was not found in the picker after
-                             scrolling. Not a web-restriction signal.
-    """
-    # Take a screenshot to see the context menu — uniquely-named so failed
-    # attempts don't overwrite history when comparing across tracks.
     tag = debug_tag or "noasin"
-    await screenshot_on_error(page, f"context_menu_{tag}")
+    try:
+        await row.scroll_into_view_if_needed(timeout=5000)
+        await row.hover(timeout=5000)
+        await page.wait_for_timeout(300)
+        more = row.locator(_ROW_MORE_BTN).first
+        if await more.count():
+            await more.click(timeout=5000)
+        else:
+            await row.click(button="right", timeout=5000)
+        await page.wait_for_selector(_MENU_ANY, state="visible", timeout=5000)
+    except Exception as e:
+        logger.warning("Track menu did not open (track=%s): %s", tag, e)
+        await screenshot_on_error(page, f"menu_failed_{tag}")
+        await _dismiss_overlays(page)
+        return "menu_failed"
 
-    # Look for "Add to playlist" in the context menu
-    add_clicked = await page.evaluate("""() => {
-        const allEls = document.querySelectorAll(
-            'music-list-item, [role="menuitem"], [role="option"], button, a, li, span, div'
-        );
-        for (const item of allEls) {
-            const text = (item.textContent || '').trim().toLowerCase();
-            const label = (item.getAttribute('aria-label') || '').toLowerCase();
-            // Match "Add to playlist" but not parent elements that contain more text
-            if ((text === 'add to playlist' || text === 'add to a playlist' ||
-                 label === 'add to playlist' || label === 'add to a playlist') &&
-                item.offsetParent !== null) {
-                item.click();
-                return 'found';
-            }
-        }
-        // Also check for primary-text attribute on music-list-item
-        const listItems = document.querySelectorAll('music-list-item');
-        for (const item of listItems) {
-            const pt = item.getAttribute('primary-text') || '';
-            if (pt.toLowerCase().includes('add to playlist')) {
-                item.click();
-                return 'found_via_attr';
-            }
-        }
-        return null;
-    }""")
-
-    if not add_clicked:
-        logger.warning(
-            "'Add to playlist' option not found in context menu "
-            "(track=%s, opened via %s)", tag, menu_opener or "?",
-        )
-        # Diagnostic dump: what music-list-items + role=menuitem elements
-        # exist in the live DOM right now? The screenshot tells us what
-        # rendered, this tells us what's reachable from
-        # document.querySelectorAll — so we can tell shadow-DOM vs
-        # attribute-not-set vs wrong-element-type apart on the next run.
-        try:
-            diag = await page.evaluate("""() => {
-                const lists = Array.from(document.querySelectorAll('music-list-item'));
-                const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
-                const opts  = Array.from(document.querySelectorAll('[role="option"]'));
-                const visible = el => {
-                    if (!el || !el.offsetParent) return false;
-                    const r = el.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0;
-                };
-                return {
-                    listCount: lists.length,
-                    listVisibleCount: lists.filter(visible).length,
-                    listPrimaryTexts: lists.slice(0, 30).map(el => ({
-                        primary: el.getAttribute('primary-text') || '',
-                        visible: visible(el),
-                        text: (el.textContent || '').trim().slice(0, 60),
-                    })),
-                    menuitemCount: items.length,
-                    menuitemTexts: items.slice(0, 30).map(el => ({
-                        text: (el.textContent || '').trim().slice(0, 60),
-                        label: (el.getAttribute('aria-label') || '').slice(0, 60),
-                        visible: visible(el),
-                    })),
-                    optionCount: opts.length,
-                    // Any element whose visible text mentions "playlist"?
-                    playlistMentions: Array.from(document.querySelectorAll('*'))
-                        .filter(el => {
-                            const t = (el.textContent || '').toLowerCase();
-                            return t.length < 80 && t.includes('add to playlist') && visible(el);
-                        })
-                        .slice(0, 10)
-                        .map(el => ({
-                            tag: el.tagName.toLowerCase(),
-                            text: (el.textContent || '').trim().slice(0, 80),
-                            primary: el.getAttribute('primary-text') || '',
-                            label: el.getAttribute('aria-label') || '',
-                        })),
-                };
-            }""")
-            logger.warning(
-                "  diag(menu): music-list-items=%d (visible=%d) "
-                "role=menuitem=%d role=option=%d 'add to playlist' "
-                "mentions=%d",
-                diag.get("listCount", -1),
-                diag.get("listVisibleCount", -1),
-                diag.get("menuitemCount", -1),
-                diag.get("optionCount", -1),
-                len(diag.get("playlistMentions") or []),
-            )
-            for entry in (diag.get("listPrimaryTexts") or [])[:15]:
-                logger.warning(
-                    "    music-list-item primary=%r visible=%s text=%r",
-                    entry.get("primary"), entry.get("visible"),
-                    entry.get("text"),
-                )
-            for entry in (diag.get("playlistMentions") or [])[:5]:
-                logger.warning(
-                    "    playlistMention tag=%s primary=%r label=%r text=%r",
-                    entry.get("tag"), entry.get("primary"),
-                    entry.get("label"), entry.get("text"),
-                )
-        except Exception:
-            logger.exception("diag(menu): collection failed (non-fatal)")
+    add_item = page.locator(_MENU_ADD).first
+    if not await add_item.count() or not await add_item.is_visible():
+        logger.warning("'Add to Playlist' not in track menu (track=%s) — likely web-restricted", tag)
         await screenshot_on_error(page, f"no_add_to_playlist_{tag}")
-        await page.keyboard.press("Escape")
+        await _dismiss_overlays(page)
         return "menu_hidden"
+    await add_item.click(timeout=5000)
+    logger.info("Clicked 'Add to Playlist' (track=%s)", tag)
 
-    logger.info("Clicked 'Add to playlist': %s", add_clicked)
+    return await _pick_playlist_in_picker(page, playlist_name)
 
-    # Wait for the playlist picker to fully load — new playlists may take
-    # a moment to appear in the list
-    await page.wait_for_timeout(4000)
 
-    # Take screenshot of playlist picker
-    await screenshot_on_error(page, "playlist_picker")
+async def _pick_playlist_in_picker(page: Page, playlist_name: str) -> str:
+    try:
+        await page.wait_for_selector(
+            f'{_PICKER} [data-testid^="AddToPlaylist_Item_"]', state="visible", timeout=10_000
+        )
+    except Exception:
+        logger.warning("Playlist picker did not appear")
+        await screenshot_on_error(page, "picker_missing")
+        await _dismiss_overlays(page)
+        return "picker_failed"
 
-    # Now a playlist picker should appear — find and click the target playlist.
-    # The picker contains music-image-row elements with primary-text attributes
-    # for each playlist name.
-
-    for attempt in range(8):
-        # Find the playlist row and click it using Playwright's native click
-        # (which properly dispatches mouse events) instead of JS .click()
-        playlist_clicked = False
-        rows = await page.query_selector_all('music-image-row[primary-text]')
-        for row in rows:
-            pt = await row.get_attribute('primary-text')
-            if not pt:
-                continue
-            if pt.strip().lower() == playlist_name.strip().lower():
-                # Check this isn't a search result row (picker rows have no secondary-text-1)
-                st1 = await row.get_attribute('secondary-text-1')
-                if st1:
-                    continue
-                # Check it's visible
-                if not await row.is_visible():
-                    continue
-                try:
-                    await row.click(timeout=3000)
-                    logger.info("Clicked playlist row '%s' via Playwright click", pt)
-                    playlist_clicked = True
-                except Exception:
-                    # Try clicking the music-link child instead
-                    link = await row.query_selector('music-link')
-                    if link:
-                        try:
-                            await link.click(timeout=3000)
-                            logger.info("Clicked playlist link '%s' via Playwright click", pt)
-                            playlist_clicked = True
-                        except Exception as e2:
-                            logger.debug("Link click also failed: %s", e2)
-                break
-
-        if playlist_clicked:
+    last_count, stale = -1, 0
+    for _ in range(200):  # 10 playlists per page -> up to ~2000 playlists
+        res = await page.evaluate(_PICKER_FIND_JS, playlist_name)
+        if res.get("found"):
+            item = page.locator('[data-amm-pick="1"]').first
+            await item.scroll_into_view_if_needed(timeout=5000)
+            await item.click(timeout=5000)
+            await page.evaluate("() => document.querySelectorAll('[data-amm-pick]').forEach(e => e.removeAttribute('data-amm-pick'))")
+            try:
+                await page.wait_for_selector(_PICKER, state="detached", timeout=8000)
+            except Exception:
+                logger.warning("Picker stayed open after choosing '%s'", playlist_name)
+                await screenshot_on_error(page, "picker_stuck")
+                await _dismiss_overlays(page)
+                return "picker_failed"
             logger.info("Added song to playlist '%s'", playlist_name)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(800)
             return ""
+        count = res.get("count", 0)
+        if count == last_count:
+            stale += 1
+            if stale >= 4:
+                break
+        else:
+            last_count, stale = count, 0
+        await page.wait_for_timeout(700)
 
-        # Scroll down in the picker in case the playlist is below the fold
-        await page.evaluate("""() => {
-            const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"], [class*="modal"], [class*="dialog"]');
-            for (const d of dialogs) {
-                const scrollable = d.querySelector('[style*="overflow"], [class*="scroll"]');
-                if (scrollable) {
-                    scrollable.scrollTop += 300;
-                    return;
-                }
-                // Try scrolling the dialog itself
-                d.scrollTop += 300;
-            }
-        }""")
-        await page.wait_for_timeout(1000)
-
-    logger.warning("Playlist '%s' not found in picker", playlist_name)
+    logger.warning("Playlist '%s' not found in picker (%d playlists listed)", playlist_name, last_count)
     await screenshot_on_error(page, "playlist_not_in_picker")
-    await page.keyboard.press("Escape")
-    await page.wait_for_timeout(500)
-    await page.keyboard.press("Escape")
+    await _dismiss_overlays(page)
     return "picker_failed"
 
 
-async def _click_more_button(page: Page, row_handle) -> bool:
-    """Try to find and click the 3-dot menu button within a row element."""
+async def create_playlist(page: Page, name: str) -> str:
+    """Create an empty playlist named *name*; return its URL ("" if unknown).
 
-    # Diagnostic: which row are we actually operating on right now? On the
-    # 2026-06-14 false-positive run mvt III's 3-dot click didn't open a
-    # menu, and we suspect the row_handle had drifted to a different row
-    # (e.g. focus moved to mvt II after auto-play kicked in). Log the
-    # row's primary-text so a follow-up run can confirm.
+    Raises RuntimeError if the create dialog can't be driven.
+    """
+    import re as _re
+    logger.info("Creating new playlist '%s'", name)
+    await page.goto(f"{BASE_URL}/my/playlists/all", wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
+    btn = page.locator('[data-testid*="LibraryPlaylists_NewPlaylistButton"]').first
     try:
-        row_info = await page.evaluate("""(row) => {
-            return {
-                primary: row.getAttribute('primary-text') || '',
-                focused: row.hasAttribute('focused'),
-                attached: row.isConnected,
-            };
-        }""", row_handle)
-        logger.info(
-            "_click_more_button: row primary=%r focused=%s attached=%s",
-            row_info.get("primary"), row_info.get("focused"),
-            row_info.get("attached"),
-        )
+        await btn.wait_for(state="visible", timeout=LONG_TIMEOUT)
+        await btn.click()
+        name_input = page.locator('[data-testid*="CreatePlaylist_TextInput"]').first
+        await name_input.wait_for(state="visible", timeout=10_000)
+        await name_input.fill(name)
+        await page.wait_for_timeout(300)
+        await page.locator('[data-testid*="CreatePlaylist_SaveButton"]').first.click()
+    except Exception as e:
+        await screenshot_on_error(page, "create_playlist_failed")
+        await _dismiss_overlays(page)
+        raise RuntimeError(f"Could not create playlist '{name}': {e}") from e
+
+    uuid_re = _re.compile(r"/playlists/([0-9a-f]{8}-[0-9a-f-]{27})")
+    try:
+        await page.wait_for_url(_re.compile(r".*/playlists/[0-9a-f]{8}-"), timeout=10_000)
     except Exception:
-        logger.exception("_click_more_button: row introspection failed")
+        await page.wait_for_timeout(2000)
+    m = uuid_re.search(page.url)
+    if not m:
+        # Didn't navigate — look the new playlist up in the library list.
+        try:
+            href = await page.evaluate(
+                """(n) => { for (const a of document.querySelectorAll('a[href*="playlists/"]')) {
+                       const t = (a.getAttribute('aria-label') || a.textContent || '').trim();
+                       if (t.toLowerCase() === n.toLowerCase()) return a.getAttribute('href'); }
+                   return ''; }""", name)
+            m = uuid_re.search(href or "")
+        except Exception:
+            m = None
+    if not m:
+        logger.warning("Playlist '%s' created but its URL is unknown (page at %s)", name, page.url)
+        return ""
+    url = f"{BASE_URL}/my/playlists/{m.group(1)}"
+    logger.info("Playlist '%s' created: %s", name, url)
+    return url
 
-    # Strategy 1: Look for music-button with icon-name="more" or similar inside the row.
-    # IMPORTANT: filter to actual button tags. <div role="button"> elements
-    # are row-click handlers whose aria-label is the track title — for any
-    # movement titled "Menuetto", "More than this", etc. their label
-    # contains the substring "menu"/"more" and would false-match the
-    # label fallback (the 2026-06-14 Beethoven 8 mvt III bug).
-    clicked = await page.evaluate("""(row) => {
-        const btns = row.querySelectorAll('music-button, button');
-        const wordBoundary = /\\b(more|menu|options)\\b/;
-        for (const btn of btns) {
-            const icon = btn.getAttribute('icon-name') || '';
-            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-            // Primary: icon-name="more" is the canonical 3-dot. The label
-            // fallback exists for tooltipped buttons whose icon attribute
-            // wasn't populated yet; require word-boundary match so
-            // "menuetto" / "more than this" track titles don't slip
-            // through.
-            if (icon === 'more' || icon === 'contextMenu' ||
-                wordBoundary.test(label) ||
-                label === 'opens menu') {
-                btn.click();
-                return 'found_direct:icon=' + (icon || '_') +
-                       '/label=' + (label || '_').slice(0, 40) +
-                       '/tag=' + btn.tagName.toLowerCase();
-            }
-        }
-        // If no "more" button found, look for ANY music-button that isn't the play button
-        for (const btn of btns) {
-            const icon = btn.getAttribute('icon-name') || '';
-            if (icon && icon !== 'play') {
-                btn.click();
-                return 'found_non_play: ' + icon;
-            }
-        }
-        return null;
-    }""", row_handle)
 
-    if clicked:
-        logger.info("_click_more_button: strategy 1 (%s)", clicked)
-        return True
+async def _create_empty_playlist(page: Page, name: str):
+    """CLI wrapper: create the playlist, falling back to asking the user."""
+    try:
+        await create_playlist(page, name)
+    except RuntimeError as e:
+        logger.warning("%s", e)
+        print(f"\n  Could not create the playlist automatically. Please create \"{name}\" manually.")
+        input("  Press Enter when ready to continue...")
 
-    # Strategy 2: Check shadow DOMs of child music-buttons
-    clicked = await page.evaluate("""(row) => {
-        const musicBtns = row.querySelectorAll('music-button');
-        for (const mb of musicBtns) {
-            if (mb.shadowRoot) {
-                const innerBtn = mb.shadowRoot.querySelector('button');
-                if (innerBtn) {
-                    const label = (innerBtn.getAttribute('aria-label') || '').toLowerCase();
-                    if (label.includes('more') || label.includes('menu') || label.includes('opens menu')) {
-                        innerBtn.click();
-                        return 'found_in_shadow';
-                    }
-                }
-            }
-        }
-        return null;
-    }""", row_handle)
 
-    if clicked:
-        logger.info("_click_more_button: strategy 2 (shadow DOM, %s)", clicked)
-        return True
-
-    # Strategy 3: Find any button with the "more" SVG icon near this row
-    box = await row_handle.bounding_box()
-    if box:
-        # Click at the far right of the row where the 3-dot button typically is
-        await page.mouse.click(box["x"] + box["width"] - 20, box["y"] + box["height"] / 2)
-        await page.wait_for_timeout(500)
-
-        # Check if a menu appeared
-        menu_appeared = await page.evaluate("""() => {
-            const menus = document.querySelectorAll(
-                '[role="menu"], [class*="context"], music-list-item'
-            );
-            return menus.length > 0;
-        }""")
-
-        if menu_appeared:
-            logger.info("_click_more_button: strategy 3 (mouse coord at "
-                        "%.0f,%.0f)", box["x"] + box["width"] - 20,
-                        box["y"] + box["height"] / 2)
-            return True
-
-    return False
+async def _add_song_to_playlist(page: Page, candidate, playlist_name: str) -> bool:
+    """Add a search-result *candidate* to *playlist_name* (via its ASINs)."""
+    asin = getattr(candidate, "asin", "")
+    album_asin = getattr(candidate, "album_asin", "")
+    if not asin or not album_asin:
+        logger.warning("Search result '%s' by '%s' has no ASIN — cannot add", candidate.title, candidate.artist)
+        return False
+    try:
+        return await add_track_by_asin(page, album_asin, asin, playlist_name)
+    except Exception as e:
+        logger.error("Failed to add song to playlist: %s", e)
+        await screenshot_on_error(page, "add_song_error")
+        await _dismiss_overlays(page)
+        return False

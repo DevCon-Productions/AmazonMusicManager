@@ -35,15 +35,35 @@ async def ensure_logged_in(page: Page) -> bool:
     return True
 
 
-async def _detect_logged_in(page: Page) -> bool:
-    """Use JavaScript to check for signs of a logged-in Amazon Music session."""
+async def _detect_logged_in(page: Page, timeout_ms: int = 10_000) -> bool:
+    """Use JavaScript to check for signs of a logged-in Amazon Music session.
+
+    Polls for up to ``timeout_ms`` because the SPA renders its content well
+    after domcontentloaded; returns as soon as a logged-in marker appears.
+    """
+    waited = 0
+    while True:
+        logged_in = await _detect_logged_in_once(page)
+        if logged_in or waited >= timeout_ms:
+            break
+        await page.wait_for_timeout(500)
+        waited += 500
+    if not logged_in:
+        logger.info("Login not detected (url=%s)", page.url)
+    return logged_in
+
+
+async def _detect_logged_in_once(page: Page) -> bool:
     logged_in = await page.evaluate("""() => {
         // Check if the URL suggests we're past the login page
         const url = window.location.href;
         if (url.includes('/ap/signin') || url.includes('/ap/register')) return false;
 
-        // Look for elements that only show for logged-in users
+        // Look for elements that only show for logged-in users.
+        // Nov 2026 redesign dropped all music-* web components; the home
+        // page now links the user's own playlists as /user-playlists/<uuid>.
         const indicators = [
+            'a[href*="/user-playlists/"]',
             'a[href*="/my/"]',
             'music-detail-header',
             '[class*="profile" i]',
@@ -56,6 +76,12 @@ async def _detect_logged_in(page: Page) -> bool:
 
         // Check if there are any music-image-row elements (content = logged in)
         if (document.querySelectorAll('music-image-row').length > 0) return true;
+
+        // Personalised shelf headings (redesigned site)
+        for (const h of document.querySelectorAll('h1, h2, h3')) {
+            if (/^(your frequent plays|recently played|your library)/i.test(
+                    (h.textContent || '').trim())) return true;
+        }
 
         return false;
     }""")

@@ -8,9 +8,15 @@
 # Run from the project root:
 #   powershell -ExecutionPolicy Bypass -File build_installer.ps1
 #
-# Result: installer_output\AmazonMusicManager-Setup-1.0.exe
+# Result: installer_output\AmazonMusicManager-Setup-<version>.exe
+# The version comes from version.py (APP_VERSION).
 
 $ErrorActionPreference = "Stop"
+
+$verLine = Select-String -Path "version.py" -Pattern '^APP_VERSION\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $verLine) { throw "Could not read APP_VERSION from version.py" }
+$version = $verLine.Matches[0].Groups[1].Value
+Write-Host "Building version $version" -ForegroundColor Cyan
 
 Write-Host "[1/2] Building the app with PyInstaller..." -ForegroundColor Cyan
 pyinstaller --noconfirm AmazonMusicManager.spec
@@ -31,6 +37,7 @@ if (-not $iscc) {
     if (Get-Command ISCC -ErrorAction SilentlyContinue) { $iscc = "ISCC" }
     else { throw "Inno Setup (ISCC.exe) not found. Install Inno Setup 6 from https://jrsoftware.org/isdl.php (or: winget install JRSoftware.InnoSetup)" }
 }
-& $iscc installer.iss
+& $iscc "/DAppVersion=$version" installer.iss
+if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed (exit $LASTEXITCODE)" }
 
 Write-Host "Done. Installer is in .\installer_output\" -ForegroundColor Green

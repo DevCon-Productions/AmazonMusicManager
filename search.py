@@ -19,8 +19,10 @@ class SearchCandidate:
     title: str
     artist: str
     album: str
-    element: object  # Playwright ElementHandle — used to click/add the song
+    element: object = None  # unused since the Nov 2026 redesign (adds go by ASIN)
     score: int = 0
+    asin: str = ""        # track ASIN
+    album_asin: str = ""
 
 
 @dataclass
@@ -62,109 +64,83 @@ def score_match(desired_title: str, desired_artist: str, candidate: SearchCandid
 async def search_songs(page: Page, query: str) -> list[SearchCandidate]:
     """Search Amazon Music and return song candidates from the Songs section.
 
-    Uses the search URL directly. Song results are `music-horizontal-item`
-    elements inside the `music-shoveler[primary-text="Songs"]` section.
+    Since the Nov 2026 redesign each result's React props carry a
+    ``trackRef`` (track ASIN, title, album {id, title}, artists), which we
+    read directly; songs are later added by ASIN.
     """
     import urllib.parse
-    encoded = urllib.parse.quote(query)
-    search_url = f"{BASE_URL}/search/{encoded}"
-
+    search_url = f"{BASE_URL}/search/{urllib.parse.quote(query)}"
     logger.debug("Navigating to search: %s", search_url)
-    await page.goto(search_url, wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
 
-    # Wait for the Songs shoveler to appear — may take longer after dialog interactions
-    shoveler_found = False
-    for wait_attempt in range(3):
+    data: list[dict] = []
+    for attempt in range(3):
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
         try:
             await page.wait_for_selector(
-                'music-shoveler[primary-text="Songs"]',
-                state="attached",
-                timeout=DEFAULT_TIMEOUT,
+                '[data-testid="SearchResultsWidget_Track"], [data-testid*="SearchResultsWidget_TopResults"]',
+                state="attached", timeout=DEFAULT_TIMEOUT,
             )
-            shoveler_found = True
-            break
         except Exception:
-            if wait_attempt < 2:
-                logger.debug("No Songs shoveler yet for '%s', retrying (attempt %d)...", query, wait_attempt + 1)
-                # Reload the search page in case it didn't load properly
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=LONG_TIMEOUT)
-            else:
-                logger.debug("No Songs shoveler found for '%s' after retries", query)
+            logger.debug("No search results yet for '%s' (attempt %d)", query, attempt + 1)
+            continue
+        await page.wait_for_timeout(1500)
+        data = await page.evaluate(_SEARCH_TRACKS_JS)
+        if data:
+            break
 
-    # Extra wait for horizontal items to populate inside the shoveler
-    await page.wait_for_timeout(3000)
+    candidates = [
+        SearchCandidate(
+            title=d.get("title", ""),
+            artist=_join_names(d.get("artists") or []),
+            album=d.get("album", ""),
+            asin=d.get("asin", ""),
+            album_asin=d.get("album_asin", ""),
+        )
+        for d in data[:15] if d.get("title") and d.get("asin")
+    ]
+    logger.info("Search: %d song results for '%s'", len(candidates), query)
+    return candidates
 
-    # Extract song results from the Songs shoveler
-    # Song results are music-horizontal-item elements with primary-text and secondary-text
-    candidates_data = await page.evaluate("""() => {
-        const results = [];
 
-        // Find the "Songs" shoveler by primary-text attribute
-        const shovelers = document.querySelectorAll('music-shoveler');
-        let songsShoveler = null;
+def _join_names(names: list[str]) -> str:
+    if len(names) <= 1:
+        return names[0] if names else ""
+    return ", ".join(names[:-1]) + " & " + names[-1]
 
-        for (const shov of shovelers) {
-            const pt = (shov.getAttribute('primary-text') || '').toLowerCase();
-            if (pt === 'songs') {
-                songsShoveler = shov;
-                break;
-            }
-        }
 
-        if (!songsShoveler) {
-            return { results: [], foundSongsShoveler: false };
-        }
-
-        // Get music-horizontal-item elements within the Songs shoveler
-        const items = songsShoveler.querySelectorAll('music-horizontal-item');
-        for (const item of items) {
-            const title = item.getAttribute('primary-text') || '';
-            const artist = item.getAttribute('secondary-text') || '';
-            if (title) {
-                results.push({ title, artist, album: '' });
-            }
-        }
-
-        return {
-            results: results.slice(0, 15),
-            foundSongsShoveler: true,
-        };
-    }""")
-
-    found_shoveler = candidates_data.get("foundSongsShoveler", False)
-    results_list = candidates_data.get("results", [])
-    logger.info("Search: %d song results (Songs shoveler: %s)", len(results_list), found_shoveler)
-
-    # Get element handles for each result so we can interact with them
-    candidates: list[SearchCandidate] = []
-
-    if results_list:
-        # Query the actual elements in the Songs shoveler
-        item_handles = await page.evaluate_handle("""() => {
-            const shovelers = document.querySelectorAll('music-shoveler');
-            for (const shov of shovelers) {
-                if ((shov.getAttribute('primary-text') || '').toLowerCase() === 'songs') {
-                    return Array.from(shov.querySelectorAll('music-horizontal-item[primary-text]'));
+# Collect Track objects from React props, Songs section first (that's what
+# the old shoveler-based search used), then any other track results.
+_SEARCH_TRACKS_JS = r"""() => {
+    const out = [], seen = new Set();
+    const collect = (root) => {
+        for (const e of root.querySelectorAll('[data-testid]')) {
+            const fk = Object.keys(e).find(k => k.startsWith('__reactFiber'));
+            let f = fk ? e[fk] : null;
+            for (let i = 0; i < 8 && f; i++, f = f.return) {
+                const p = f.memoizedProps;
+                const t = p && (p.trackRef || p.track);
+                if (t && t.__typename === 'Track' && t.id) {
+                    if (!seen.has(t.id)) {
+                        seen.add(t.id);
+                        out.push({
+                            asin: t.id,
+                            title: t.title || t.shortTitle || '',
+                            album: (t.album && (t.album.title || t.album.shortTitle)) || '',
+                            album_asin: (t.album && t.album.id) || '',
+                            artists: ((t.contributingArtists || {}).edges || [])
+                                .map(a => a && a.node && a.node.name).filter(Boolean),
+                        });
+                    }
+                    break;
                 }
             }
-            return [];
-        }""")
-
-        # Get individual element handles
-        count = await item_handles.evaluate("arr => arr.length")
-        for i in range(min(count, len(results_list))):
-            handle = await item_handles.evaluate_handle("(arr, i) => arr[i]", i)
-            data = results_list[i]
-            if data.get("title"):
-                candidates.append(SearchCandidate(
-                    title=data["title"],
-                    artist=data["artist"],
-                    album=data["album"],
-                    element=handle,
-                ))
-
-    logger.debug("Search for '%s' returned %d candidates", query, len(candidates))
-    return candidates
+        }
+    };
+    const songs = document.querySelector('[data-testid="SearchResultsWidget_Track"]');
+    if (songs) collect(songs);
+    collect(document);
+    return out;
+}"""
 
 
 async def hybrid_select(

@@ -74,6 +74,8 @@ from PyQt6.QtWidgets import (
 from openpyxl import load_workbook
 
 from browser import BrowserManager, minimize_process_windows
+from update_ui import UpdateController
+from version import APP_VERSION
 from organization import (
     add_item,
     create_folder,
@@ -5225,6 +5227,55 @@ def _find_playlists_by_name(name: str) -> list[dict]:
     return list(seen.values())
 
 
+_ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|&|\band\b|\bfeat\.?|\bft\.?|\bwith\b|/)\s*", re.IGNORECASE)
+
+
+def _artist_names(artist: str) -> set[str]:
+    from utils import normalize
+    return {n for n in (normalize(p) for p in _ARTIST_SPLIT_RE.split(artist or "")) if n}
+
+
+class _ExistingSongIndex:
+    """Decides whether a scraped song is already in a sheet.
+
+    Amazon's display strings drift over time (and the Nov 2026 redesign
+    lists every contributing artist where older exports had one name or
+    "VARIOUS ARTISTS"), so an exact (title, artist, album) match would
+    re-append most of a playlist. A song counts as existing when its track
+    ASIN is in the sheet, or its normalized title matches a row whose
+    artists overlap OR whose album matches, or whose artist is "Various
+    Artists".
+    """
+
+    def __init__(self) -> None:
+        from utils import normalize
+        self._norm = normalize
+        self.asins: set[str] = set()
+        self.by_title: dict[str, list[tuple[set[str], str]]] = {}
+        self.count = 0
+
+    def add(self, title: str, artist: str, album: str, asin: str = "") -> None:
+        if asin:
+            self.asins.add(asin)
+        self.by_title.setdefault(self._norm(title), []).append(
+            (_artist_names(artist), self._norm(album))
+        )
+        self.count += 1
+
+    def contains(self, title: str, artist: str, album: str, asin: str = "") -> bool:
+        if asin and asin in self.asins:
+            return True
+        cands = self.by_title.get(self._norm(title))
+        if not cands:
+            return False
+        names = _artist_names(artist)
+        alb = self._norm(album)
+        for ex_names, ex_album in cands:
+            if names & ex_names or (alb and alb == ex_album) or "various artists" in ex_names:
+                return True
+        return False
+
+
 def _build_update_coroutine(xlsx_path: str, url: str, metadata: bool):
     """Return an async callable `fn(page)` that appends new songs to *xlsx_path*.
 
@@ -5274,23 +5325,28 @@ def _build_update_coroutine(xlsx_path: str, url: str, metadata: bool):
             wb.worksheets[0],
         )
 
-        existing_keys: set[tuple] = set()
+        header = [str(c.value or "").strip() for c in ws[1]]
+        asin_col = header.index("Track ASIN") + 1 if "Track ASIN" in header else None
+        album_asin_col = header.index("Album ASIN") + 1 if "Album ASIN" in header else None
+
+        existing_keys = _ExistingSongIndex()
         for row in ws.iter_rows(min_row=2, values_only=False):
             title = row[1].value or ""
             if not title:
                 continue
             artist = row[2].value or ""
             album = row[3].value or ""
-            existing_keys.add(
-                (normalize(str(title)), normalize(str(artist)),
-                 normalize(str(album)))
-            )
+            asin = str(row[asin_col - 1].value or "") if asin_col and len(row) >= asin_col else ""
+            existing_keys.add(str(title), str(artist), str(album), asin)
+        existing_count = existing_keys.count
 
-        new_songs = [
-            s for s in playlist.songs
-            if (normalize(s.title), normalize(s.artist), normalize(s.album))
-            not in existing_keys
-        ]
+        new_songs = []
+        for s in playlist.songs:
+            if existing_keys.contains(s.title, s.artist, s.album, s.asin):
+                continue
+            new_songs.append(s)
+            # Also guard against the same song appearing twice in the scrape.
+            existing_keys.add(s.title, s.artist, s.album, s.asin)
 
         # When metadata is requested, also enrich existing rows that are
         # missing year or genre — update those cells in-place.
@@ -5342,7 +5398,7 @@ def _build_update_coroutine(xlsx_path: str, url: str, metadata: bool):
             set_source(xlsx_path, url=source_url, name=source_name)
             msg = (
                 f"No new songs — '{os.path.basename(xlsx_path)}' is up to date "
-                f"({len(existing_keys)} songs"
+                f"({existing_count} songs"
                 + (f", enriched {enriched_existing} existing" if enriched_existing else "")
                 + ")."
             )
@@ -5350,12 +5406,12 @@ def _build_update_coroutine(xlsx_path: str, url: str, metadata: bool):
             return {
                 "added": 0,
                 "enriched": enriched_existing,
-                "total": len(existing_keys),
+                "total": existing_count,
                 "path": xlsx_path,
             }
 
         logger.info("Found %d new song(s) (existing: %d).",
-                    len(new_songs), len(existing_keys))
+                    len(new_songs), existing_count)
 
         next_row = ws.max_row + 1
         for i, song in enumerate(new_songs):
@@ -5370,12 +5426,16 @@ def _build_update_coroutine(xlsx_path: str, url: str, metadata: bool):
             ws.cell(row=row_idx, column=5, value=date_val)
             ws.cell(row=row_idx, column=6, value=song.genre)
             ws.cell(row=row_idx, column=7, value=song.duration)
+            if asin_col:
+                ws.cell(row=row_idx, column=asin_col, value=song.asin)
+            if album_asin_col:
+                ws.cell(row=row_idx, column=album_asin_col, value=song.album_asin)
         wb.save(xlsx_path)
         wb.close()
         set_tag(xlsx_path, TAG_AMAZON)
         set_updated(xlsx_path)
         set_source(xlsx_path, url=source_url, name=source_name)
-        total = len(existing_keys) + len(new_songs)
+        total = existing_keys.count
         logger.info("Added %d new song(s) to %s (total: %d)",
                     len(new_songs), os.path.basename(xlsx_path), total)
         return {
@@ -7330,118 +7390,14 @@ def _build_bulk_delete_coroutine(
     return _do_bulk_delete
 
 
-async def _gui_create_empty_playlist(page, name: str) -> None:
-    """GUI variant of ``importer._create_empty_playlist`` that raises on
-    failure instead of blocking on ``input()``. Mirrors the working DOM dance.
+async def _gui_create_empty_playlist(page, name: str) -> str:
+    """Create an empty playlist; return its URL ("" if unknown).
+
+    Raises RuntimeError on failure (the GUI shows it) instead of blocking on
+    ``input()`` like the CLI path.
     """
-    from config import BASE_URL, LONG_TIMEOUT
-
-    logger.info("Creating new playlist '%s'", name)
-    await page.goto(
-        f"{BASE_URL}/my/playlists/all",
-        wait_until="domcontentloaded",
-        timeout=LONG_TIMEOUT,
-    )
-    await page.wait_for_timeout(3000)
-
-    clicked = await page.evaluate("""() => {
-        const els = document.querySelectorAll('music-button, button, a, [role="button"]');
-        for (const el of els) {
-            const text = (el.textContent || '').trim().toLowerCase();
-            if (text.includes('create playlist')) {
-                el.click();
-                return true;
-            }
-        }
-        return false;
-    }""")
-    if not clicked:
-        raise RuntimeError(
-            "Could not find the 'Create Playlist' button on the playlists "
-            "page. Make sure you're signed in and try again."
-        )
-    await page.wait_for_timeout(3000)
-
-    curate_handle = await page.evaluate_handle("""() => {
-        const d = document.querySelector('[role="dialog"], [aria-modal="true"]');
-        if (!d) return null;
-        const rows = d.querySelectorAll('music-image-row');
-        for (const row of rows) {
-            const pt = (row.getAttribute('primary-text') || '').toLowerCase();
-            if (pt.includes('curate')) return row;
-        }
-        return null;
-    }""")
-    is_null = await curate_handle.evaluate("el => el === null")
-    if is_null:
-        raise RuntimeError(
-            "Could not find the 'Curate a playlist' option in the create-"
-            "playlist dialog."
-        )
-
-    box = await curate_handle.bounding_box()
-    if not box:
-        raise RuntimeError(
-            "Could not locate the 'Curate a playlist' element on screen."
-        )
-    await page.mouse.click(
-        box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-    )
-    await page.wait_for_timeout(3000)
-
-    name_input = await page.query_selector('input[placeholder*="Playlist" i]')
-    if not name_input:
-        name_input = await page.query_selector('[role="dialog"] input[type="text"]')
-    if name_input:
-        await name_input.fill("")
-        await name_input.type(name, delay=30)
-        await page.wait_for_timeout(500)
-    else:
-        await page.keyboard.type(name, delay=30)
-
-    save_btn = await page.query_selector(
-        '[role="dialog"] music-button:has-text("Save")'
-    )
-    if not save_btn:
-        save_handle = await page.evaluate_handle("""() => {
-            const d = document.querySelector('[role="dialog"], [aria-modal="true"]');
-            if (!d) return null;
-            const btns = d.querySelectorAll('music-button, button');
-            for (const btn of btns) {
-                const text = (btn.textContent || '').trim().toLowerCase();
-                if (text === 'save') return btn;
-            }
-            return null;
-        }""")
-        is_null = await save_handle.evaluate("el => el === null")
-        if not is_null:
-            save_btn = save_handle
-
-    if save_btn:
-        box = await save_btn.bounding_box()
-        if box:
-            await page.mouse.click(
-                box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-            )
-        else:
-            await save_btn.click()
-    else:
-        await page.keyboard.press("Enter")
-
-    import re as _re
-    try:
-        await page.wait_for_url(
-            _re.compile(r".*/my/playlists/[0-9a-f]{8}-"),
-            timeout=8000,
-        )
-    except Exception:
-        await page.wait_for_timeout(3000)
-    logger.info("Playlist '%s' created", name)
-    url = page.url
-    if not _re.search(r"/my/playlists/[0-9a-f]{8}-", url):
-        logger.warning("Playlist created but could not determine its URL (page is at %s)", url)
-        url = ""
-    return url
+    from importer import create_playlist
+    return await create_playlist(page, name)
 
 
 def _build_create_coroutine(
@@ -11771,7 +11727,7 @@ class AboutDialog(QDialog):
             "<div align='center'>"
             "<p style='font-size:16pt; font-weight:bold; margin-bottom:2px;'>"
             "Amazon Music Manager</p>"
-            "<p style='margin-top:0;'>Version 1.0</p>"
+            f"<p style='margin-top:0;'>Version {APP_VERSION}</p>"
             "<p><b>DevCon Productions</b><br>Cleveland, Ohio, USA</p>"
             "<p style='color:gray;'>Vibe coded with Claude Code</p>"
             "</div>"
@@ -11838,6 +11794,7 @@ class MainWindow(QMainWindow):
 
         self._tray: QSystemTrayIcon | None = None
 
+        self._updates = UpdateController(self)
         self._build_menu_bar()
         self._build_toolbar()
         self._build_central()
@@ -11859,6 +11816,11 @@ class MainWindow(QMainWindow):
 
         if settings.value("connect/auto", False, type=bool):
             QTimer.singleShot(0, self._on_connect_clicked)
+
+        # Quiet background update check a few seconds after launch; it only
+        # speaks up if a newer release exists.
+        if settings.value("updates/check_on_startup", True, type=bool):
+            QTimer.singleShot(4000, lambda: self._updates.check(manual=False))
 
     # --- UI construction ---------------------------------------------------
     def _build_menu_bar(self) -> None:
@@ -11917,6 +11879,24 @@ class MainWindow(QMainWindow):
         guide_action.setStatusTip("How to use Amazon Music Manager")
         guide_action.triggered.connect(self._on_show_user_guide)
         help_menu.addAction(guide_action)
+
+        help_menu.addSeparator()
+        update_action = QAction("Check for Updates…", self)
+        update_action.setStatusTip("See if a newer version is available and install it")
+        update_action.triggered.connect(lambda: self._updates.check(manual=True))
+        help_menu.addAction(update_action)
+
+        autoupdate_action = QAction("Check for updates on startup", self)
+        autoupdate_action.setCheckable(True)
+        autoupdate_action.setChecked(
+            settings.value("updates/check_on_startup", True, type=bool)
+        )
+        autoupdate_action.toggled.connect(
+            lambda on: QSettings("VYSERIX", "AmazonMusicManager").setValue(
+                "updates/check_on_startup", on
+            )
+        )
+        help_menu.addAction(autoupdate_action)
 
         help_menu.addSeparator()
         about_action = QAction("About Amazon Music Manager", self)
